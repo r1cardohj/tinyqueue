@@ -76,7 +76,7 @@ func (q *LevelDBQueue) Enqueue(value []byte) error {
 
 func (q *LevelDBQueue) Dequeue() ([]byte, error) {
 	q.mu.Lock()
-	defer q.mu.Lock()
+	defer q.mu.Unlock()
 
 	if q.dequeued >= q.enqueued {
 		return nil, errors.New("queue is empty")
