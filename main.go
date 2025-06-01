@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 )
 
 func main() {
@@ -11,24 +12,16 @@ func main() {
 		return
 	}
 
-	fmt.Println("enqueue now...")
-	err = q.Enqueue([]byte("hello world"))
+	app := &App{
+		queue: q,
+		port: "8000",
+		host: "127.0.0.1",
+	}
+
+	err = http.ListenAndServe(app.host + ":" + app.port, app);
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-
-	fmt.Println("current size is",  q.Size())
-
-	value, err := q.Dequeue()
-
-	if err != nil {
-
-		fmt.Println(err)
-		return
-	}
-	fmt.Println("pop value", string(value))
-
-	fmt.Println("current size is",  q.Size())
 }
 
