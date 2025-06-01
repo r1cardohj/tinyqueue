@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"sync"
+	"fmt"
 
 	"github.com/dgraph-io/badger"
 )
@@ -34,6 +35,8 @@ func NewQueue(path string, prefix []byte) (*Queue, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	fmt.Println("current queue size:", queue.Size())
 
 	return queue, nil
 }
