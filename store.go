@@ -37,6 +37,9 @@ func NewQueue(path string, prefix []byte, safe bool) (*Queue, error) {
 		return nil, err
 	}
 
+	log.Println("queue initialized with prefix:", string(q.prefix))
+	log.Println("enqueued items:", atomic.LoadUint64(&q.enqueued))
+	log.Println("dequeued items:", atomic.LoadUint64(&q.dequeued))
 	log.Println("current size is", q.Size())
 
 	return q, nil
@@ -78,8 +81,7 @@ func (q *Queue) Enqueue(value []byte) error {
 }
 
 func (q *Queue) Dequeue() ([]byte, error) {
-	const maxRetry = 1000
-	for retry := 0; retry < maxRetry; retry++ {
+	for {
 		id := atomic.LoadUint64(&q.dequeued) + 1
 		if id > atomic.LoadUint64(&q.enqueued) {
 			return nil, errors.New("queue is empty")
@@ -87,29 +89,32 @@ func (q *Queue) Dequeue() ([]byte, error) {
 		key := make([]byte, len(q.prefix)+8)
 		copy(key, q.prefix)
 		binary.BigEndian.PutUint64(key[len(q.prefix):], id)
+
 		var value []byte
-		err := q.db.Update(func(txn *badger.Txn) error {
+		err := q.db.View(func(txn *badger.Txn) error {
 			item, err := txn.Get(key)
 			if err != nil {
 				return err
 			}
 			value, err = item.ValueCopy(nil)
-			if err != nil {
-				return err
-			}
-			return txn.Delete(key)
+			return err
 		})
 		if err == nil {
+			// when successfully dequeued, increment the dequeued counter
 			atomic.AddUint64(&q.dequeued, 1)
+
 			return value, nil
+
 		}
-		if err == badger.ErrKeyNotFound || err == badger.ErrConflict {
-			time.Sleep(100 * time.Microsecond)
+		if err == badger.ErrKeyNotFound {
+			// if the key is not found, it means the item was already dequeued
+			// or deleted by GC, so we wait a bit and retry
+			time.Sleep(10 * time.Microsecond)
 			continue
 		}
+
 		return nil, err
 	}
-	return nil, errors.New("dequeue failed after max retries")
 }
 
 func (q *Queue) Size() uint64 {
