@@ -1,27 +1,23 @@
 package main
 
 import (
-	"fmt"
-	"net/http"
+	"log"
+	"os"
+	"time"
 )
 
 func main() {
-	q, err := NewQueue("queue.db", []byte("queue_"))
+	q, err := NewQueue("queue.db", []byte("queue_"), true)
 	if err != nil {
-		fmt.Println(err)
+		log.Panic(err)
 		return
 	}
+	app := NewApp(q, "127.0.0.1", "8000", 15*time.Second)
 
-	app := &App{
-		queue: q,
-		port: "8000",
-		host: "127.0.0.1",
-	}
-
-	err = http.ListenAndServe(app.host + ":" + app.port, app);
+	err = app.Run()
 	if err != nil {
-		fmt.Println(err)
-		return
+		log.Println("server start error!")
+		os.Exit(1)
 	}
+	log.Println("Server shutdown gracefully")
 }
-

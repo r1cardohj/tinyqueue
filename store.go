@@ -3,143 +3,142 @@ package main
 import (
 	"encoding/binary"
 	"errors"
-	"sync"
-	"fmt"
+	"log"
+	"sync/atomic"
+	"time"
 
 	"github.com/dgraph-io/badger"
 )
 
 type Queue struct {
 	db       *badger.DB
-	path     string
 	prefix   []byte
-	mu       sync.Mutex
 	enqueued uint64
 	dequeued uint64
 }
 
-func NewQueue(path string, prefix []byte) (*Queue, error) {
+func NewQueue(path string, prefix []byte, safe bool) (*Queue, error) {
 	opts := badger.DefaultOptions(path)
+	opts.Logger = nil
+	opts.SyncWrites = safe // async is not safe but terrible fast
 	db, err := badger.Open(opts)
 	if err != nil {
 		return nil, err
 	}
 
-	queue := &Queue{
+	q := &Queue{
 		db:     db,
-		path:   path,
 		prefix: prefix,
 	}
 
-	err = queue.restoreCounters()
+	err = q.restoreCounters()
 	if err != nil {
+		db.Close()
 		return nil, err
 	}
 
-	fmt.Println("current queue size:", queue.Size())
+	log.Println("current size is", q.Size())
 
-	return queue, nil
+	return q, nil
 }
 
 func (q *Queue) restoreCounters() error {
 	return q.db.View(func(txn *badger.Txn) error {
-		// recover enqueued counter
-		enqKey := append(q.prefix, []byte("_meta_enqueued")...)
+		// restore enqueued and dequeued counters
+		enqKey := append(q.prefix, []byte("_enq")...)
 		item, err := txn.Get(enqKey)
 		if err == nil {
 			val, err := item.ValueCopy(nil)
 			if err == nil && len(val) == 8 {
-				q.enqueued = binary.BigEndian.Uint64(val)
+				atomic.StoreUint64(&q.enqueued, binary.BigEndian.Uint64(val))
 			}
 		}
 
-		// recover dequeued counter
-		deqKey := append(q.prefix, []byte("_meta_dequeued")...)
+		deqKey := append(q.prefix, []byte("_deq")...)
 		item, err = txn.Get(deqKey)
 		if err == nil {
 			val, err := item.ValueCopy(nil)
 			if err == nil && len(val) == 8 {
-				q.dequeued = binary.BigEndian.Uint64(val)
+				atomic.StoreUint64(&q.dequeued, binary.BigEndian.Uint64(val))
 			}
 		}
-
 		return nil
 	})
 }
 
-func (q *Queue) Close() error {
-	return q.db.Close()
-}
-
-func (q *Queue) generateKey() []byte {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.enqueued++
-
-	_ = q.db.Update(func(txn *badger.Txn) error {
-		key := append(q.prefix, []byte("_meta_enqueued")...)
-		val := make([]byte, 8)
-		binary.BigEndian.PutUint64(val, q.enqueued)
-		return txn.Set(key, val)
-	})
-
+func (q *Queue) Enqueue(value []byte) error {
+	id := atomic.AddUint64(&q.enqueued, 1)
 	key := make([]byte, len(q.prefix)+8)
 	copy(key, q.prefix)
-	binary.BigEndian.PutUint64(key[len(q.prefix):], q.enqueued)
-	return key
-}
+	binary.BigEndian.PutUint64(key[len(q.prefix):], id)
 
-func (q *Queue) Enqueue(value []byte) error {
 	return q.db.Update(func(txn *badger.Txn) error {
-		return txn.Set(q.generateKey(), value)
+		return txn.Set(key, value)
 	})
 }
 
 func (q *Queue) Dequeue() ([]byte, error) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	if q.dequeued >= q.enqueued {
-		return nil, errors.New("queue is empty")
-	}
-
-	nextID := q.dequeued + 1
-	key := make([]byte, len(q.prefix)+8)
-	copy(key, q.prefix)
-	binary.BigEndian.PutUint64(key[len(q.prefix):], nextID)
-
-	var value []byte
-	err := q.db.Update(func(txn *badger.Txn) error {
-		item, err := txn.Get(key)
-		if err != nil {
-			return err
+	const maxRetry = 1000
+	for retry := 0; retry < maxRetry; retry++ {
+		id := atomic.LoadUint64(&q.dequeued) + 1
+		if id > atomic.LoadUint64(&q.enqueued) {
+			return nil, errors.New("queue is empty")
 		}
-
-		value, err = item.ValueCopy(nil)
-		if err != nil {
-			return err
+		key := make([]byte, len(q.prefix)+8)
+		copy(key, q.prefix)
+		binary.BigEndian.PutUint64(key[len(q.prefix):], id)
+		var value []byte
+		err := q.db.Update(func(txn *badger.Txn) error {
+			item, err := txn.Get(key)
+			if err != nil {
+				return err
+			}
+			value, err = item.ValueCopy(nil)
+			if err != nil {
+				return err
+			}
+			return txn.Delete(key)
+		})
+		if err == nil {
+			atomic.AddUint64(&q.dequeued, 1)
+			return value, nil
 		}
-
-		if err := txn.Delete(key); err != nil {
-			return err
+		if err == badger.ErrKeyNotFound || err == badger.ErrConflict {
+			time.Sleep(100 * time.Microsecond)
+			continue
 		}
-
-		q.dequeued = nextID
-		metaKey := append(q.prefix, []byte("_meta_dequeued")...)
-		val := make([]byte, 8)
-		binary.BigEndian.PutUint64(val, q.dequeued)
-		return txn.Set(metaKey, val)
-	})
-
-	if err != nil {
 		return nil, err
 	}
-
-	return value, nil
+	return nil, errors.New("dequeue failed after max retries")
 }
 
 func (q *Queue) Size() uint64 {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.enqueued - q.dequeued
+	return atomic.LoadUint64(&q.enqueued) - atomic.LoadUint64(&q.dequeued)
+}
+
+func (q *Queue) Close() error {
+	// save enqueued and dequeued counters
+	err := q.db.Update(func(txn *badger.Txn) error {
+		enqKey := append(q.prefix, []byte("_enq")...)
+		enqVal := make([]byte, 8)
+		binary.BigEndian.PutUint64(enqVal, atomic.LoadUint64(&q.enqueued))
+		if err := txn.Set(enqKey, enqVal); err != nil {
+			return err
+		}
+
+		deqKey := append(q.prefix, []byte("_deq")...)
+		deqVal := make([]byte, 8)
+		binary.BigEndian.PutUint64(deqVal, atomic.LoadUint64(&q.dequeued))
+		return txn.Set(deqKey, deqVal)
+	})
+
+	if err != nil {
+		return err
+	}
+
+	if err := q.db.Sync(); err != nil {
+		return err
+	}
+
+	return q.db.Close()
 }
